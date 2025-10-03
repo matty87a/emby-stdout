@@ -1,0 +1,153 @@
+name: Deploy and Test Emby Logger
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Deploy Docker Compose stack
+      run: |
+        docker-compose up -d --build
+        
+    - name: Wait for services to start
+      run: |
+        echo "Waiting for services to initialize..."
+        sleep 10
+        
+    - name: Check container status
+      run: |
+        echo "Checking container status..."
+        docker-compose ps
+        
+    - name: Check Emby server logs for startup
+      run: |
+        echo "Checking Emby server logs for startup indicators..."
+        docker-compose logs emby | head -50
+        
+        # Check if Emby server started successfully
+        if docker-compose logs emby | grep -q "Application path: /system/EmbyServer.dll"; then
+          echo "✅ Emby server application started"
+        else
+          echo "❌ Emby server application failed to start"
+          exit 1
+        fi
+        
+        # Check for any fatal errors or crashes
+        if docker-compose logs emby | grep -q "fatal\|Killed\|Segmentation fault"; then
+          echo "❌ Fatal errors detected in logs"
+          docker-compose logs emby | grep -E "fatal|Killed|Segmentation fault"
+          exit 1
+        else
+          echo "✅ No fatal errors detected in logs"
+        fi
+        
+    - name: Wait 30 seconds for stability
+      run: |
+        echo "Waiting 30 seconds to check for stability..."
+        sleep 30
+        
+    - name: Verify Emby server process is still running
+      run: |
+        echo "Checking if Emby server process is still running..."
+        
+        # Check if container is still running
+        if ! docker-compose ps | grep -q "Up"; then
+          echo "❌ Container is not running"
+          docker-compose ps
+          exit 1
+        fi
+        
+        # Check for EmbyServer process inside container
+        EMBY_PID=$(docker-compose exec -T emby ps aux | grep -E "EmbyServer|emby" | grep -v grep | awk '{print $2}' | head -1)
+        if [ -z "$EMBY_PID" ]; then
+          echo "❌ EmbyServer process not found"
+          docker-compose exec -T emby ps aux
+          exit 1
+        else
+          echo "✅ EmbyServer process is running (PID: $EMBY_PID)"
+        fi
+        
+    - name: Verify logs are continuing to flow
+      run: |
+        echo "Checking if logs are continuing to flow..."
+        
+        # Get initial log count
+        INITIAL_LOG_COUNT=$(docker-compose logs emby | wc -l)
+        echo "Initial log count: $INITIAL_LOG_COUNT"
+        
+        # Wait 10 seconds
+        sleep 10
+        
+        # Get new log count
+        NEW_LOG_COUNT=$(docker-compose logs emby | wc -l)
+        echo "New log count: $NEW_LOG_COUNT"
+        
+        # Check if logs increased
+        if [ "$NEW_LOG_COUNT" -gt "$INITIAL_LOG_COUNT" ]; then
+          echo "✅ Logs are continuing to flow"
+        else
+          echo "❌ Logs are not flowing - possible issue"
+          echo "Recent logs:"
+          docker-compose logs emby --tail 20
+          exit 1
+        fi
+        
+    - name: Test Emby web interface accessibility
+      run: |
+        echo "Testing Emby web interface accessibility..."
+        
+        # Wait a bit more for web interface to be ready
+        sleep 5
+        
+        # Test HTTP response
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8096 || echo "000")
+        echo "HTTP response code: $HTTP_CODE"
+        
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ] || [ "$HTTP_CODE" = "401" ]; then
+          echo "✅ Emby web interface is accessible"
+        else
+          echo "⚠️  Emby web interface not accessible (HTTP $HTTP_CODE) - this might be normal during initial setup"
+        fi
+        
+    - name: Display final status
+      run: |
+        echo "=== Final Status Report ==="
+        echo "Container status:"
+        docker-compose ps
+        echo ""
+        echo "Recent logs:"
+        docker-compose logs emby --tail 10
+        echo ""
+        echo "Process list:"
+        docker-compose exec -T emby ps aux | head -10
+        
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "Test failed - displaying full logs for debugging:"
+        docker-compose logs emby
+        echo ""
+        echo "Container processes:"
+        docker-compose exec -T emby ps aux
+        echo ""
+        echo "Cleaning up..."
+        docker-compose down
+        
+    - name: Cleanup on success
+      if: success()
+      run: |
+        echo "Test passed - cleaning up..."
+        docker-compose down

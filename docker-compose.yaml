@@ -1,0 +1,13 @@
+services:
+  emby:
+    build:
+      context: ./src
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Europe/London}
+      - EMBY_LOGS=${EMBY_LOGS:-embyserver,ffmpeg,hardware} 
+    ports:
+      - "8096:8096"
