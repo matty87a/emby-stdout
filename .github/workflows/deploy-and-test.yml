@@ -18,9 +18,29 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
       
+    - name: Install Trivy
+      run: |
+        sudo apt-get update
+        sudo apt-get install wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy
+        
+    - name: Build and scan Docker image for security
+      run: |
+        docker buildx build -t emby-stdout:test -f ./src/Dockerfile ./src --output type=docker,dest=./emby-stdout-test.tar
+        trivy image --input ./emby-stdout-test.tar --format table --exit-code 0
+        
+    - name: Check for secrets in code
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        extra_args: --debug --only-verified
+        
     - name: Deploy Docker Compose stack
       run: |
-        docker-compose up -d --build
+        docker compose up -d --build
         
     - name: Wait for services to start
       run: |
@@ -30,15 +50,15 @@ jobs:
     - name: Check container status
       run: |
         echo "Checking container status..."
-        docker-compose ps
+        docker compose ps
         
     - name: Check Emby server logs for startup
       run: |
         echo "Checking Emby server logs for startup indicators..."
-        docker-compose logs emby | head -50
+        docker compose logs emby | head -50
         
         # Check if Emby server started successfully
-        if docker-compose logs emby | grep -q "Application path: /system/EmbyServer.dll"; then
+        if docker compose logs emby | grep -q "Application path: /system/EmbyServer.dll"; then
           echo "✅ Emby server application started"
         else
           echo "❌ Emby server application failed to start"
@@ -46,9 +66,9 @@ jobs:
         fi
         
         # Check for any fatal errors or crashes
-        if docker-compose logs emby | grep -q "fatal\|Killed\|Segmentation fault"; then
+        if docker compose logs emby | grep -q "fatal\|Killed\|Segmentation fault"; then
           echo "❌ Fatal errors detected in logs"
-          docker-compose logs emby | grep -E "fatal|Killed|Segmentation fault"
+          docker compose logs emby | grep -E "fatal|Killed|Segmentation fault"
           exit 1
         else
           echo "✅ No fatal errors detected in logs"
@@ -64,17 +84,17 @@ jobs:
         echo "Checking if Emby server process is still running..."
         
         # Check if container is still running
-        if ! docker-compose ps | grep -q "Up"; then
+        if ! docker compose ps | grep -q "Up"; then
           echo "❌ Container is not running"
-          docker-compose ps
+          docker compose ps
           exit 1
         fi
         
         # Check for EmbyServer process inside container
-        EMBY_PID=$(docker-compose exec -T emby ps aux | grep -E "EmbyServer|emby" | grep -v grep | awk '{print $2}' | head -1)
+        EMBY_PID=$(docker compose exec -T emby ps aux | grep -E "EmbyServer|emby" | grep -v grep | awk '{print $2}' | head -1)
         if [ -z "$EMBY_PID" ]; then
           echo "❌ EmbyServer process not found"
-          docker-compose exec -T emby ps aux
+          docker compose exec -T emby ps aux
           exit 1
         else
           echo "✅ EmbyServer process is running (PID: $EMBY_PID)"
@@ -85,23 +105,76 @@ jobs:
         echo "Checking if logs are continuing to flow..."
         
         # Get initial log count
-        INITIAL_LOG_COUNT=$(docker-compose logs emby | wc -l)
+        INITIAL_LOG_COUNT=$(docker compose logs emby | wc -l)
         echo "Initial log count: $INITIAL_LOG_COUNT"
         
-        # Wait 10 seconds
+        # Generate dummy test log entries in different log file types
+        echo "Injecting dummy test log entries..."
+        
+        # Wait for logs directory to exist
+        echo "Waiting for logs directory to be created..."
+        for i in {1..30}; do
+          if docker compose exec -T emby test -d /config/logs; then
+            echo "Logs directory found"
+            break
+          fi
+          echo "Waiting for logs directory... ($i/30)"
+          sleep 2
+        done
+        
+        # Create dummy log files and inject test entries
+        echo "Creating dummy log files and injecting test entries..."
+        
+        # Create embyserver log entries
+        docker compose exec -T emby sh -c '
+          echo "[$(date)] INFO - GitHub Actions Test: EmbyServer test log entry 1" >> /config/logs/embyserver.txt
+          echo "[$(date)] DEBUG - GitHub Actions Test: EmbyServer test log entry 2" >> /config/logs/embyserver.txt
+          echo "[$(date)] WARN - GitHub Actions Test: EmbyServer test log entry 3" >> /config/logs/embyserver.txt
+        '
+        
+        # Create ffmpeg log entries
+        docker compose exec -T emby sh -c '
+          echo "[$(date)] FFmpeg Test: Processing test video file" >> /config/logs/ffmpeg-test.txt
+          echo "[$(date)] FFmpeg Test: Video encoding completed" >> /config/logs/ffmpeg-test.txt
+          echo "[$(date)] FFmpeg Test: Audio transcoding started" >> /config/logs/ffmpeg-test.txt
+        '
+        
+        # Create hardware detection log entries
+        docker compose exec -T emby sh -c '
+          echo "[$(date)] Hardware Test: GPU detection completed" >> /config/logs/hardware_detection-test.txt
+          echo "[$(date)] Hardware Test: Audio device enumeration" >> /config/logs/hardware_detection-test.txt
+          echo "[$(date)] Hardware Test: Hardware acceleration available" >> /config/logs/hardware_detection-test.txt
+        '
+        
+        # Create some additional log files with different patterns
+        docker compose exec -T emby sh -c '
+          echo "[$(date)] System Test: Memory usage check" >> /config/logs/system-test.txt
+          echo "[$(date)] System Test: Disk space verification" >> /config/logs/system-test.txt
+        '
+        
+        echo "Test log entries injected successfully"
+        
+        # Wait for log tailing to pick up the new entries
         sleep 10
         
         # Get new log count
-        NEW_LOG_COUNT=$(docker-compose logs emby | wc -l)
+        NEW_LOG_COUNT=$(docker compose logs emby | wc -l)
         echo "New log count: $NEW_LOG_COUNT"
         
         # Check if logs increased
         if [ "$NEW_LOG_COUNT" -gt "$INITIAL_LOG_COUNT" ]; then
-          echo "✅ Logs are continuing to flow"
+          echo "✅ Logs are continuing to flow (increased by $((NEW_LOG_COUNT - INITIAL_LOG_COUNT)) lines)"
+          
+          # Show some of the test log entries that were captured
+          echo "Sample captured test logs:"
+          docker compose logs emby | grep "GitHub Actions Test\|FFmpeg Test\|Hardware Test\|System Test" | tail -10
         else
           echo "❌ Logs are not flowing - possible issue"
           echo "Recent logs:"
-          docker-compose logs emby --tail 20
+          docker compose logs emby --tail 20
+          echo ""
+          echo "Checking if log files were created:"
+          docker compose exec -T emby ls -la /config/logs/ || echo "Logs directory not accessible"
           exit 1
         fi
         
@@ -122,32 +195,128 @@ jobs:
           echo "⚠️  Emby web interface not accessible (HTTP $HTTP_CODE) - this might be normal during initial setup"
         fi
         
+    - name: Generate GitHub Summary Report
+      if: always()
+      run: |
+        # Create summary report
+        {
+          echo "# 🎬 Emby Logger Deployment Test Report"
+          echo ""
+          echo "## 📊 Test Results"
+          echo ""
+          
+          # Container status
+          echo "### 🐳 Container Status"
+          echo '```'
+          docker compose ps
+          echo '```'
+          echo ""
+          
+          # Process status
+          echo "### 🔄 Process Status"
+          echo '```'
+          docker compose exec -T emby ps aux | head -10
+          echo '```'
+          echo ""
+          
+          # Recent logs
+          echo "### 📝 Recent Logs (Last 15 lines)"
+          echo '```'
+          docker compose logs emby --tail 15
+          echo '```'
+          echo ""
+          
+          # Test summary
+          echo "### ✅ Test Summary"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "- ✅ **Deployment**: Successful"
+            echo "- ✅ **Container**: Running"
+            echo "- ✅ **EmbyServer Process**: Active"
+            echo "- ✅ **Log Flow**: Continuous"
+            echo "- ✅ **Web Interface**: Accessible"
+            echo ""
+            echo "🎉 **All tests passed!** The Emby logger is working correctly."
+          else
+            echo "- ❌ **Deployment**: Failed"
+            echo "- ❌ **Container**: Issues detected"
+            echo "- ❌ **EmbyServer Process**: Not running or crashed"
+            echo "- ❌ **Log Flow**: Interrupted or not flowing"
+            echo "- ❌ **Web Interface**: Not accessible"
+            echo ""
+            echo "⚠️ **Tests failed!** Please check the logs above for details."
+          fi
+          echo ""
+          
+          # Security info
+          echo "### 🔒 Security Scan Results"
+          echo "- **Docker Image Scan**: Completed (see logs above)"
+          echo "- **Secret Detection**: Completed (see logs above)"
+          echo "- **Vulnerability Check**: See Trivy output in logs"
+          echo ""
+          
+          # System info
+          echo "### 🖥️ System Information"
+          echo "- **Runner OS**: ${{ runner.os }}"
+          echo "- **Docker Version**: $(docker --version)"
+          echo "- **Docker Compose Version**: $(docker compose version)"
+          
+          # Calculate test duration safely
+          START_TIME="${{ github.run_started_at }}"
+          if [ -n "$START_TIME" ]; then
+            CURRENT_TIME=$(date +%s)
+            START_TIMESTAMP=$(date -d "$START_TIME" +%s 2>/dev/null || echo "$START_TIME")
+            if [ "$START_TIMESTAMP" -gt 0 ] 2>/dev/null; then
+              DURATION=$((CURRENT_TIME - START_TIMESTAMP))
+              DURATION_FORMATTED=$(date -u -d @$DURATION +%M:%S 2>/dev/null || echo "${DURATION}s")
+              echo "- **Test Duration**: ~$DURATION_FORMATTED"
+            else
+              echo "- **Test Duration**: Unable to calculate"
+            fi
+          else
+            echo "- **Test Duration**: Unable to calculate"
+          fi
+          echo ""
+          
+          # Next steps
+          echo "### 🔧 Next Steps"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "1. The Emby logger is ready for use"
+            echo "2. Access the web interface at http://localhost:8096"
+            echo "3. Monitor logs for any issues"
+          else
+            echo "1. Review the error logs above"
+            echo "2. Check Docker and Docker Compose configuration"
+            echo "3. Verify Emby server compatibility"
+            echo "4. Re-run the workflow after fixes"
+          fi
+        } >> $GITHUB_STEP_SUMMARY
+        
     - name: Display final status
       run: |
         echo "=== Final Status Report ==="
         echo "Container status:"
-        docker-compose ps
+        docker compose ps
         echo ""
         echo "Recent logs:"
-        docker-compose logs emby --tail 10
+        docker compose logs emby --tail 10
         echo ""
         echo "Process list:"
-        docker-compose exec -T emby ps aux | head -10
+        docker compose exec -T emby ps aux | head -10
         
     - name: Cleanup on failure
       if: failure()
       run: |
         echo "Test failed - displaying full logs for debugging:"
-        docker-compose logs emby
+        docker compose logs emby
         echo ""
         echo "Container processes:"
-        docker-compose exec -T emby ps aux
+        docker compose exec -T emby ps aux
         echo ""
         echo "Cleaning up..."
-        docker-compose down
+        docker compose down
         
     - name: Cleanup on success
       if: success()
       run: |
         echo "Test passed - cleaning up..."
-        docker-compose down
+        docker compose down

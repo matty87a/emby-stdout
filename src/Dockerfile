@@ -1,4 +1,4 @@
-FROM emby/embyserver:beta
+FROM emby/embyserver:latest
 
 COPY tail-logs.sh /usr/local/bin/tail-logs.sh
 RUN chmod +x /usr/local/bin/tail-logs.sh
